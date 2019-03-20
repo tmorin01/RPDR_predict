@@ -1,0 +1,132 @@
+---
+title: "rpdr_nb"
+author: "Thomas Morin"
+date: "2/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(knitr)
+library(googlesheets)
+library(rstan)
+library(e1071)
+knitr::dep_prev()
+```
+
+## Wrangle
+
+We begin by data wrangling, getting data into R in a useful form. We import and join datasets. We standardize continuous variables (see [this paper](http://www.stat.columbia.edu/~gelman/research/published/standardizing7.pdf)).
+
+```{r wrangled, message = FALSE, warning = FALSE, cache = TRUE}
+gs_auth()
+rpdr_data <- "1Sotvl3o7J_ckKUg5sRiZTqNQn3hPqhepBSeOpMTK15Q" %>%  gs_key
+
+all_episodes <- rpdr_data %>% gs_read("all_episodes") %>%
+  arrange(season_number, episode_number) %>% rowid_to_column("t")
+all_contestants <- rpdr_data %>% gs_read("all_contestants")
+all_rankings <- rpdr_data %>% gs_read("all_rankings")
+all_social <- rpdr_data %>% gs_read("all_social_media")
+```
+
+```{r, wrangled, message=FALSE, warning=FALSE, cache=TRUE}
+
+all_social %>% mutate(date = as.Date(datetime, "%Y-%m-%d"))
+
+first_episodes <- filter(all_episodes, episode_number == 1)
+mid_episodes <- filter(all_episodes, episode_number == 6)
+final_episodes <- filter(all_episodes, episode_type == "Finale")
+
+start_dates <- first_episodes$episode_airdate
+# NEEDSWORK: Wrangle social data based on contestant, and season start date... get number of followers
+#            for each contestant at the beginning, middle, and end of the season
+
+wrangled <- all_rankings %>%
+  left_join(all_contestants, by = c("season_number","contestant_id")) %>%
+  left_join(all_episodes, by=c("season_number", "episode_number")) %>%
+  mutate(placement = case_when(is.element(episode_placement,c('WIN','Winner','HIGH','Runner-up')) ~ 1,
+                      is.element(episode_placement,c('ELIM','Eliminated','BTM2'))  ~ -1,
+                      TRUE ~ 0)) %>%
+  group_by(t) %>% mutate(num_winners = sum(placement == 1), 
+                         num_losers = sum(placement == -1)) %>% 
+  arrange(desc(placement), .by_group = TRUE) %>% ungroup() %>% # within episode: winner first, loser last
+  filter(is.element(episode_type,c('Competition','Finale'))) %>%
+  #filter(num_winners == 1, num_losers == 1) %>% # only use data on typical episodes
+  filter(!is.element(episode_placement,c('Guest','Miss C'))) %>%
+  group_by(contestant_id) %>% mutate(past_wins = cumsum(placement == 1) - (placement == 1)) %>%
+  mutate(past_losses = cumsum(placement == -1) - (placement == -1)) %>%
+  ungroup() %>%
+  mutate(z.past_wins = (past_wins - mean(past_wins))/(2*sd(past_wins))) %>%
+  mutate(z.past_losses = (past_losses - mean(past_losses))/(2*sd(past_losses))) %>%
+  mutate(z.age = (age - mean(age))/(2*sd(age))) %>%
+  mutate(pctl.past_wins = as.factor(round(pnorm(z.past_wins), 1))) %>%
+  mutate(pctl.past_losses = as.factor(round(pnorm(z.past_losses),1))) %>%
+  mutate(pctl.age = as.factor(round(pnorm(z.age),1))) %>%
+  select(season_number, episode_number, t, contestant_id, # identifiers
+         pctl.past_wins, pctl.past_losses, pctl.age,
+         z.age, z.past_wins, z.past_losses, contestant_entrance, hometown_state,# x variables
+         placement, num_winners, num_losers) # episode outcomes
+
+# renumber episodes skipping the atypical ones:
+wrangled$t <- as.numeric(as.factor(wrangled$t))
+
+early_episodes <- filter(wrangled, episode_number %in% c(1,2,3,4,5))
+mid_episodes <- filter(wrangled, episode_number %in% c(5,6,7,8,9))
+late_episodes <- filter(wrangled, episode_number %in% c(9,10,11,12,13,14,15))
+all_episodes <- wrangled
+
+early_factors <- select(early_episodes, pctl.past_wins, pctl.past_losses, pctl.age, hometown_state, contestant_entrance)
+mid_factors <- select(mid_episodes, pctl.past_wins, pctl.past_losses, pctl.age, hometown_state)
+late_factors <- select(late_episodes, pctl.past_wins, pctl.past_losses, pctl.age, hometown_state)
+all_factors <- select(all_episodes, pctl.past_wins, pctl.past_losses, pctl.age, hometown_state)
+```
+
+
+Next, we train the Naive Bayes Classifier
+
+```{r wrangled, message = FALSE, warning = FALSE, cache = TRUE}
+classifier_early <- naiveBayes(early_factors, early_episodes$placement, laplace=1)
+classifier_mid <- naiveBayes(mid_factors, mid_episodes$placement, laplace=1)
+classifier_late <- naiveBayes(late_factors, late_episodes$placement, laplace=1)
+classifier_all <- naiveBayes(all_factors, all_episodes$placement, laplace=1)
+```
+
+Now we run the trained model on the testing data
+
+```{r wrangled, message = FALSE, warning = FALSE, cache = TRUE}
+# FOR WEEK ONE, NO HISTORY FOR THESE CONTESTANTS
+#all_contestants2 <- all_contestants %>% mutate(z.age = (age - mean(age))/(2*sd(age))) %>%
+#  mutate(pctl.age = as.factor(round(pnorm(z.age),1))) %>%
+#  mutate(pctl.past_wins = 0.3) %>%
+#  mutate(pctl.past_losses = 0.4)
+
+all_contestants2 <- select(early_episodes, season_number, episode_number, contestant_id, pctl.age, pctl.past_wins, pctl.past_losses, hometown_state, contestant_entrance)
+
+test_data <- filter(all_contestants2, season_number == 11)
+
+# REMOVE ELIMINATED QUEENS
+test_data <- test_data[!(test_data$contestant_id %in% c(144)), ]
+test_data <- select(test_data, pctl.past_wins, pctl.past_losses, pctl.age, hometown_state, contestant_entrance, contestant_id)
+
+pred <- predict(classifier_early, test_data, type="raw")
+
+results <- test_data %>%
+  mutate(prob_loss = pred[,1]) %>%
+  mutate(prob_safe = pred[,2]) %>%
+  mutate(prob_win = pred[,3]) %>%
+  left_join(select(all_contestants, contestant_id, contestant_name), by = c("contestant_id"))
+
+final_results <- select(results, contestant_name, prob_loss, prob_safe, prob_win)
+```
+
+RESULTS:
+Sorted by Probability of a Win:
+```{r wrangled, message = FALSE, warning = FALSE, cache = TRUE}
+final_results[order(final_results$prob_win),]
+```
+
+Sorted by Probability of a Loss:
+```{r wrangled, message = FALSE, warning = FALSE, cache = TRUE}
+final_results[order(final_results$prob_loss),]
+```
+
